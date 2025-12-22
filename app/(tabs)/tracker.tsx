@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -6,8 +6,11 @@ import {
   Pressable,
   ScrollView,
   Modal,
+  ActivityIndicator,
 } from "react-native";
 import { Link } from "expo-router";
+import type { Session } from "@supabase/supabase-js";
+import { supabase } from "@/lib/supabase";
 
 const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 const MONTH_NAMES = [
@@ -39,6 +42,14 @@ function isSameDay(a: Date, b: Date) {
     a.getMonth() === b.getMonth() &&
     a.getDate() === b.getDate()
   );
+}
+
+// Local YYYY-MM-DD (no UTC conversion)
+function toDateKey(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function getCalendarDays(year: number, month: number) {
@@ -75,13 +86,23 @@ function getCalendarDays(year: number, month: number) {
 export default function TrackerScreen() {
   const today = useMemo(() => new Date(), []);
   const [selectedDate, setSelectedDate] = useState<Date>(today);
-  const [displayedMonth, setDisplayedMonth] = useState<number>(
-    today.getMonth()
-  );
-  const [displayedYear, setDisplayedYear] = useState<number>(
-    today.getFullYear()
-  );
+  const [displayedMonth, setDisplayedMonth] = useState<number>(today.getMonth());
+  const [displayedYear, setDisplayedYear] = useState<number>(today.getFullYear());
   const [pickerVisible, setPickerVisible] = useState(false);
+
+  // Auth + month entry markers
+  const [session, setSession] = useState<Session | null>(null);
+  const [loadingMonth, setLoadingMonth] = useState(false);
+  const [entryDays, setEntryDays] = useState<Set<string>>(new Set());
+
+  // Keep session in sync
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
 
   // Week strip based on selected date
   const weekStart = useMemo(() => startOfWeek(selectedDate), [selectedDate]);
@@ -104,8 +125,7 @@ export default function TrackerScreen() {
   // Year options: currentYear-2 through currentYear+4 (7 years rolling)
   const currentYear = today.getFullYear();
   const yearOptions = useMemo(
-    () =>
-      Array.from({ length: 7 }, (_, i) => currentYear - 2 + i),
+    () => Array.from({ length: 7 }, (_, i) => currentYear - 2 + i),
     [currentYear]
   );
 
@@ -140,6 +160,50 @@ export default function TrackerScreen() {
     return `${MONTH_NAMES[selectedDate.getMonth()]} ${selectedDate.getDate()}, ${selectedDate.getFullYear()}`;
   }, [selectedDate]);
 
+  const selectedKey = useMemo(() => toDateKey(selectedDate), [selectedDate]);
+  const hasEntryForSelected = useMemo(() => entryDays.has(selectedKey), [entryDays, selectedKey]);
+
+  // Fetch entries for displayed month (only dates)
+  useEffect(() => {
+    const run = async () => {
+      if (!session?.user) return;
+
+      setLoadingMonth(true);
+      try {
+        const monthStart = new Date(displayedYear, displayedMonth, 1);
+        const monthEnd = new Date(displayedYear, displayedMonth + 1, 0); // last day of month
+
+        const startKey = toDateKey(monthStart);
+        const endKey = toDateKey(monthEnd);
+
+        // RLS will ensure user only sees their rows, but we also filter for performance
+        const { data, error } = await supabase
+          .from("progress_logs")
+          .select("entry_date")
+          .gte("entry_date", startKey)
+          .lte("entry_date", endKey)
+          .order("entry_date", { ascending: true });
+
+        if (error) throw error;
+
+        const s = new Set<string>();
+        for (const row of data ?? []) {
+          // entry_date comes back as 'YYYY-MM-DD' string
+          if (row?.entry_date) s.add(String(row.entry_date));
+        }
+        setEntryDays(s);
+      } catch (e) {
+        // Don’t crash UI; you can add a toast later
+        setEntryDays(new Set());
+        console.warn("Failed to load month progress logs:", e);
+      } finally {
+        setLoadingMonth(false);
+      }
+    };
+
+    run();
+  }, [session?.user?.id, displayedYear, displayedMonth]);
+
   return (
     <View style={styles.container}>
       {/* Month + week strip */}
@@ -149,10 +213,7 @@ export default function TrackerScreen() {
             {MONTH_NAMES[selectedDate.getMonth()]} {selectedDate.getFullYear()}
           </Text>
 
-          <Pressable
-            style={styles.monthPickerButton}
-            onPress={() => setPickerVisible(true)}
-          >
+          <Pressable style={styles.monthPickerButton} onPress={() => setPickerVisible(true)}>
             <Text style={styles.monthPickerText}>Change month</Text>
           </Pressable>
         </View>
@@ -165,34 +226,26 @@ export default function TrackerScreen() {
           <View style={styles.weekStrip}>
             {weekDays.map((date, index) => {
               const isSelected = isSameDay(date, selectedDate);
+              const key = toDateKey(date);
+              const hasEntry = entryDays.has(key);
+
               return (
                 <Pressable
                   key={index}
-                  style={[
-                    styles.weekDayItem,
-                    isSelected && styles.weekDayItemSelected,
-                  ]}
+                  style={[styles.weekDayItem, isSelected && styles.weekDayItemSelected]}
                   onPress={() => handleSelectDate(date)}
                 >
-                  <Text style={styles.weekDayLabel}>
-                    {DAY_LABELS[date.getDay()]}
-                  </Text>
+                  <Text style={styles.weekDayLabel}>{DAY_LABELS[date.getDay()]}</Text>
+
                   <View style={styles.dotWrapper}>
-                    <View
-                      style={[
-                        styles.dayDot,
-                        isSelected && styles.dayDotSelected,
-                      ]}
-                    >
-                      <Text
-                        style={[
-                          styles.dayDotText,
-                          isSelected && styles.dayDotTextSelected,
-                        ]}
-                      >
+                    <View style={[styles.dayDot, isSelected && styles.dayDotSelected]}>
+                      <Text style={[styles.dayDotText, isSelected && styles.dayDotTextSelected]}>
                         {date.getDate()}
                       </Text>
                     </View>
+
+                    {/* DB marker */}
+                    {hasEntry && <View style={[styles.entryMarker, isSelected && styles.entryMarkerSelected]} />}
                   </View>
                 </Pressable>
               );
@@ -203,6 +256,14 @@ export default function TrackerScreen() {
             <Text style={styles.arrowText}>{">"}</Text>
           </Pressable>
         </View>
+
+        {/* Tiny loading indicator for month fetch */}
+        {loadingMonth && (
+          <View style={styles.loadingRow}>
+            <ActivityIndicator />
+            <Text style={styles.loadingText}>Loading entries…</Text>
+          </View>
+        )}
       </View>
 
       {/* Calendar */}
@@ -218,13 +279,13 @@ export default function TrackerScreen() {
         <View style={styles.calendarGrid}>
           {calendarDays.map(({ date, inCurrentMonth }, idx) => {
             const isSelected = isSameDay(date, selectedDate);
+            const key = toDateKey(date);
+            const hasEntry = entryDays.has(key);
+
             return (
               <Pressable
                 key={idx}
-                style={[
-                  styles.calendarCell,
-                  isSelected && styles.calendarCellSelected,
-                ]}
+                style={[styles.calendarCell, isSelected && styles.calendarCellSelected]}
                 onPress={() => handleSelectDate(date)}
               >
                 <Text
@@ -236,31 +297,34 @@ export default function TrackerScreen() {
                 >
                   {date.getDate()}
                 </Text>
+
+                {/* DB marker */}
+                {hasEntry && <View style={[styles.calendarEntryDot, isSelected && styles.calendarEntryDotSelected]} />}
               </Pressable>
             );
           })}
         </View>
       </View>
 
-      {/* Add entry button */}
+      {/* Add/edit entry button */}
       <View style={styles.bottomSection}>
         <Text style={styles.selectedDateLabel}>Selected date</Text>
         <Text style={styles.selectedDateValue}>{formattedSelected}</Text>
 
         <Link
-  href={{
-    pathname: "/entry",
-    params: { date: selectedDate.toISOString() },
-  }}
-  asChild
->
-  <Pressable style={styles.addEntryButton}>
-    <Text style={styles.addEntryText}>
-      Add entry for {formattedSelected}
-    </Text>
-  </Pressable>
-</Link>
-
+          href={{
+            pathname: "/entry",
+            params: { date: selectedDate.toISOString() },
+          }}
+          asChild
+        >
+          <Pressable style={styles.addEntryButton}>
+            <Text style={styles.addEntryText}>
+              {hasEntryForSelected ? "Edit entry for " : "Add entry for "}
+              {formattedSelected}
+            </Text>
+          </Pressable>
+        </Link>
       </View>
 
       {/* Month/Year picker modal */}
@@ -280,13 +344,8 @@ export default function TrackerScreen() {
                 {MONTH_NAMES.map((name, idx) => (
                   <Pressable
                     key={name}
-                    style={[
-                      styles.monthItem,
-                      idx === displayedMonth && styles.monthItemSelected,
-                    ]}
-                    onPress={() =>
-                      handleMonthYearChange(idx, displayedYear)
-                    }
+                    style={[styles.monthItem, idx === displayedMonth && styles.monthItemSelected]}
+                    onPress={() => handleMonthYearChange(idx, displayedYear)}
                   >
                     <Text
                       style={[
@@ -305,13 +364,8 @@ export default function TrackerScreen() {
                 {yearOptions.map((year) => (
                   <Pressable
                     key={year}
-                    style={[
-                      styles.yearItem,
-                      year === displayedYear && styles.yearItemSelected,
-                    ]}
-                    onPress={() =>
-                      handleMonthYearChange(displayedMonth, year)
-                    }
+                    style={[styles.yearItem, year === displayedYear && styles.yearItemSelected]}
+                    onPress={() => handleMonthYearChange(displayedMonth, year)}
                   >
                     <Text
                       style={[
@@ -326,10 +380,7 @@ export default function TrackerScreen() {
               </ScrollView>
             </View>
 
-            <Pressable
-              style={styles.modalCloseButton}
-              onPress={() => setPickerVisible(false)}
-            >
+            <Pressable style={styles.modalCloseButton} onPress={() => setPickerVisible(false)}>
               <Text style={styles.modalCloseText}>Done</Text>
             </Pressable>
           </View>
@@ -349,14 +400,12 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: NEUTRAL_BG,
-    paddingTop: 90,        // ⬅️ was 50 — move EVERYTHING further down
+    paddingTop: 90,
     paddingHorizontal: 16,
     paddingBottom: 16,
   },
   topSection: {
     marginBottom: 20,
-    // optional: you can also add marginTop here instead of paddingTop on container
-    // marginTop: 20,
   },
   monthHeaderRow: {
     flexDirection: "row",
@@ -445,13 +494,35 @@ const styles = StyleSheet.create({
     color: TEXT,
   },
 
-  // ⬇️ CALENDAR BLOCK – pushed further down & feels more centered
+  // New: entry marker for week strip
+  entryMarker: {
+    marginTop: 6,
+    width: 6,
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: "#6B7280",
+  },
+  entryMarkerSelected: {
+    backgroundColor: ACCENT,
+  },
+
+  loadingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 10,
+  },
+  loadingText: {
+    color: MUTED,
+    fontSize: 12,
+  },
+
   calendarSection: {
     backgroundColor: CARD_BG,
     borderRadius: 18,
     padding: 12,
-    marginTop: 40,     // ⬅️ add space between week strip and calendar
-    marginBottom: 24,  // ⬅️ a bit more breathing room above bottom section
+    marginTop: 40,
+    marginBottom: 24,
   },
   calendarHeaderRow: {
     flexDirection: "row",
@@ -487,6 +558,19 @@ const styles = StyleSheet.create({
   },
   calendarCellTextSelected: {
     fontWeight: "700",
+  },
+
+  // New: entry dot in calendar cell
+  calendarEntryDot: {
+    position: "absolute",
+    bottom: 10,
+    width: 5,
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: "#6B7280",
+  },
+  calendarEntryDotSelected: {
+    backgroundColor: ACCENT,
   },
 
   bottomSection: {
